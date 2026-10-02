@@ -53,6 +53,9 @@ USER_AGENT = (
 )
 MATHJAX_CDN = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"
 PLACEHOLDER_PAGE = "000"
+COVER_SELECTOR = 'img.quarto-cover-image, .cover img, img.cover, img[src*="cover"]'
+# Website-only pages that a printed book would not contain (matched on file name).
+DEFAULT_EXCLUDE = "translations.html,print-version.html,reviews.html,error.html"
 TOP_MARGIN_MM, BOTTOM_MARGIN_MM, SIDE_MARGIN_MM = 22, 20, 18
 TOP_MARGIN_PT, BOTTOM_MARGIN_PT = TOP_MARGIN_MM * 72 / 25.4, BOTTOM_MARGIN_MM * 72 / 25.4
 
@@ -95,6 +98,10 @@ class Book:
 # --------------------------------------------------------------------------- #
 
 
+class BotChallengeError(RuntimeError):
+    """The site served an anti-bot challenge page instead of content."""
+
+
 class Fetcher:
     def __init__(self, cache_dir: Path, delay: float):
         self.cache_dir = cache_dir
@@ -110,6 +117,13 @@ class Fetcher:
                 req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     data = resp.read()
+                    challenged = resp.headers.get("sg-captcha") or b"sgcaptcha" in data[:2000]
+                if challenged:
+                    raise BotChallengeError(
+                        f"{url} answered with a bot-protection challenge instead of the page. "
+                        "The site's host blocks this network (common for cloud servers). "
+                        "Run the script from a home or office connection, and consider a larger --delay."
+                    )
                 time.sleep(self.delay)
                 return data
             except urllib.error.HTTPError as e:
@@ -252,7 +266,7 @@ def discover_structure(index_html: str, base_url: str) -> Book:
     if not authors:
         authors = [clean_text(p) for p in soup.select(".quarto-title-meta-contents p.author, .quarto-title-author-name, p.author")]
     book.authors = [a for a in dict.fromkeys(authors) if a]
-    cover = soup.select_one("img.quarto-cover-image, .cover img, img.cover")
+    cover = soup.select_one(COVER_SELECTOR)
     if cover is not None and cover.get("src"):
         book.cover_img = urljoin(base_url, cover["src"])
     return book
@@ -310,8 +324,9 @@ def prepare_page(page: Page, raw_html: str, book: Book, fetcher: Fetcher, is_ind
     if is_index:
         for el in content.select("#title-block-header, header#title-block-header, .quarto-title-block"):
             el.decompose()
-        for el in content.select("img.quarto-cover-image, .cover"):
-            el.decompose()
+        cover = content.select_one(COVER_SELECTOR)
+        if cover is not None:
+            (cover.find_parent(["figure", "p"]) or cover).decompose()
 
     # Tabsets: print every tab, each preceded by its label.
     for tabset in content.select(".panel-tabset"):
@@ -867,6 +882,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-pages", type=int, default=0, help="only convert the first N pages (testing)")
     ap.add_argument("--mathjax", default=None, help="path or URL of MathJax tex-svg.js")
     ap.add_argument("--chromium", default=None, help="path to a Chromium executable")
+    ap.add_argument("--exclude", default=DEFAULT_EXCLUDE,
+                    help="comma-separated page file names to leave out (empty string keeps all)")
     ap.add_argument("--no-google-fonts", action="store_true", help="use only locally installed fonts")
     args = ap.parse_args(argv)
 
@@ -876,8 +893,14 @@ def main(argv: list[str] | None = None) -> int:
     fetcher = Fetcher(cache, args.delay)
 
     print(f"[1/6] Reading table of contents from {base_url}")
-    index_html = fetcher.page(norm_url(base_url))
+    try:
+        index_html = fetcher.page(norm_url(base_url))
+    except BotChallengeError as err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 2
     book = discover_structure(index_html, base_url)
+    excluded = {x.strip() for x in args.exclude.split(",") if x.strip()}
+    book.pages = [p for p in book.pages if urlparse(p.url).path.rsplit("/", 1)[-1] not in excluded]
     if args.max_pages:
         book.pages = book.pages[: args.max_pages]
     print(f"      '{book.title}' by {', '.join(book.authors) or 'unknown'}: "
@@ -886,6 +909,14 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: could not find the book's table of contents.", file=sys.stderr)
         return 1
 
+    try:
+        return build(args, book, fetcher, cache)
+    except BotChallengeError as err:
+        print(f"ERROR: {err}", file=sys.stderr)
+        return 2
+
+
+def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -> int:
     print("[2/6] Downloading and cleaning pages")
     if book.cover_img:
         local = fetcher.asset(book.cover_img)

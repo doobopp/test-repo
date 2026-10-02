@@ -26,7 +26,8 @@ python -m playwright install chromium   # once
 python book_to_pdf.py                   # writes fpppy.pdf
 ```
 
-Options: `--page-size A4|Letter|A5`, `--toc-depth 1|2|3`, `--out FILE`,
+Options: `--page-size A4|Letter|A5`, `--toc-depth 1|2|3`, `--out FILE`, `--exclude` (website-only
+pages left out; default: translations, print-version, reviews, error),
 `--max-pages N` (quick trial), `--no-google-fonts`, `--chromium PATH`.
 Downloads are cached in `.book_cache/`, so re-runs are fast. Node/npm is used, if
 present, to install MathJax locally; otherwise it is loaded from jsDelivr.
