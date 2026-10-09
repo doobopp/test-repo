@@ -1,0 +1,3 @@
+.book_cache/
+*.pdf
+__pycache__/
