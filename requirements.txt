@@ -1,3 +1,4 @@
 playwright>=1.42
 beautifulsoup4>=4.12
 pymupdf>=1.24
+pillow>=10.0

@@ -34,6 +34,8 @@ import argparse
 import hashlib
 import html
 import json
+import math
+import zlib
 import re
 import shutil
 import subprocess
@@ -51,7 +53,8 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/141.0 Safari/537.36 book-to-pdf/1.0 (personal offline copy)"
 )
-MATHJAX_CDN = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"
+MATHJAX_CDN = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/{script}"
+MATHJAX_SCRIPTS = {"chtml": "tex-chtml.js", "svg": "tex-svg.js"}
 PLACEHOLDER_PAGE = "000"
 COVER_SELECTOR = 'img.quarto-cover-image, .cover img, img.cover, img[src*="cover"]'
 # Website-only pages that a printed book would not contain (matched on file name).
@@ -689,6 +692,7 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
             "packages": {"[+]": ["ams", "newcommand", "boldsymbol"]},
         },
         "svg": {"fontCache": "global"},
+        "chtml": {"matchFontHeight": False},
         "options": {"skipHtmlTags": ["script", "noscript", "style", "textarea", "pre", "code"]},
         "startup": {"typeset": True},
     }
@@ -710,10 +714,13 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
 # --------------------------------------------------------------------------- #
 
 
-def find_mathjax(cache_dir: Path, explicit: str | None) -> str:
+def find_mathjax(cache_dir: Path, explicit: str | None, mode: str = "chtml") -> str:
+    """Locate MathJax. "chtml" draws math with fonts (each glyph stored once in the PDF,
+    and the math is searchable); "svg" draws every glyph as vector outlines (larger)."""
     if explicit:
         return Path(explicit).resolve().as_uri() if Path(explicit).exists() else explicit
-    local = cache_dir / "mathjax" / "node_modules" / "mathjax" / "es5" / "tex-svg.js"
+    script = MATHJAX_SCRIPTS[mode]
+    local = cache_dir / "mathjax" / "node_modules" / "mathjax" / "es5" / script
     if not local.exists() and shutil.which("npm"):
         print("Installing MathJax locally (npm) ...")
         (cache_dir / "mathjax").mkdir(exist_ok=True)
@@ -721,7 +728,7 @@ def find_mathjax(cache_dir: Path, explicit: str | None) -> str:
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if local.exists():
         return local.resolve().as_uri()
-    return MATHJAX_CDN
+    return MATHJAX_CDN.format(script=script)
 
 
 def render_pdf(html_path: Path, pdf_path: Path, page_size: str, chromium_path: str | None):
@@ -769,8 +776,62 @@ def locate_markers(pdf_path: Path) -> dict[str, tuple[int, float]]:
     return found
 
 
+def palettize_images(doc, min_psnr: float = 45.0) -> tuple[int, int]:
+    """Store full-colour images as 256-colour indexed images when that is visually identical.
+
+    Chromium writes every image as full RGB. Charts use few distinct colours, so an
+    indexed copy keeps nearly every pixel exact at a fraction of the size (measured on
+    matplotlib charts: about half, at 67 dB PSNR). An image is only replaced when its
+    PSNR against the original is at least `min_psnr` and the result is smaller;
+    photos (JPEG) and images that fail either test are left untouched.
+    Returns (images replaced, bytes saved).
+    """
+    import pymupdf as fitz
+    from PIL import Image, ImageChops, ImageStat
+
+    replaced = saved = 0
+    seen: set[int] = set()
+    for page in doc:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            obj = doc.xref_object(xref, compressed=True)
+            base = doc.xref_get_key(xref, "ColorSpace")
+            if ("/DCTDecode" in obj or doc.xref_get_key(xref, "BitsPerComponent")[1] != "8"
+                    or not (base[0] in ("xref", "array") or base[1] == "/DeviceRGB") or "/Indexed" in base[1]):
+                continue
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.n != 3 or pix.alpha:
+                    continue
+                rgb = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                pal = rgb.quantize(256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+                mse = sum(ImageStat.Stat(ImageChops.difference(rgb, pal.convert("RGB"))).sum2) / (3 * rgb.width * rgb.height)
+                if mse and 10 * math.log10(255**2 / mse) < min_psnr:
+                    continue
+                palette = bytes(pal.getpalette()[: 3 * (pal.getextrema()[1] + 1)])
+                old_size = len(doc.xref_stream_raw(xref))
+                data = pal.tobytes()
+                if len(zlib.compress(data, 9)) >= old_size:
+                    continue
+                smask = doc.xref_get_key(xref, "SMask")
+                new = (f"<< /Type /XObject /Subtype /Image /Width {pix.width} /Height {pix.height} "
+                       f"/ColorSpace [/Indexed {base[1]} {len(palette) // 3 - 1} <{palette.hex()}>] "
+                       f"/BitsPerComponent 8" + (f" /SMask {smask[1]}" if smask[0] == "xref" else "") + " >>")
+                doc.update_object(xref, new)
+                doc.update_stream(xref, data, compress=True)
+                replaced += 1
+                saved += old_size - len(doc.xref_stream_raw(xref))
+            except Exception as err:  # never let an optimisation break the book
+                print(f"  note: image {xref} left as is ({err})")
+    return replaced, saved
+
+
 def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading],
-                chapters: list[tuple[str, str]], positions: dict[str, tuple[int, float]]):
+                chapters: list[tuple[str, str]], positions: dict[str, tuple[int, float]],
+                optimize_images: bool = True):
     import pymupdf as fitz
 
     doc = fitz.open(pdf_in)
@@ -831,7 +892,11 @@ def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading]
         "subject": f"Offline copy of {book.base_url}",
         "creator": "book_to_pdf.py (Chromium + PyMuPDF)",
     })
-    doc.save(pdf_out, garbage=3, deflate=True)
+    if optimize_images:
+        n, saved = palettize_images(doc)
+        print(f"  images: {n} stored as 256-colour (visually identical), {saved / 1e6:.1f} MB saved")
+    # Lossless: drop unused/duplicate objects, compress everything, pack small objects into streams.
+    doc.save(pdf_out, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, use_objstms=1)
     doc.close()
 
 
@@ -880,7 +945,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="1 = chapters, 2 = + sections, 3 = + subsections")
     ap.add_argument("--delay", type=float, default=0.3, help="seconds between downloads")
     ap.add_argument("--max-pages", type=int, default=0, help="only convert the first N pages (testing)")
-    ap.add_argument("--mathjax", default=None, help="path or URL of MathJax tex-svg.js")
+    ap.add_argument("--mathjax", default=None, help="path or URL of a MathJax tex-chtml.js / tex-svg.js")
+    ap.add_argument("--math", default="chtml", choices=["chtml", "svg"],
+                    help="chtml: math drawn with fonts (smaller, searchable); svg: vector outlines")
+    ap.add_argument("--no-image-optimization", action="store_true",
+                    help="keep images in full colour (skip the visually identical 256-colour conversion)")
     ap.add_argument("--chromium", default=None, help="path to a Chromium executable")
     ap.add_argument("--exclude", default=DEFAULT_EXCLUDE,
                     help="comma-separated page file names to leave out (empty string keeps all)")
@@ -926,7 +995,7 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
         prepare_page(page, raw, book, fetcher, is_index=(i == 0))
     rewrite_links(book)
 
-    mathjax_src = find_mathjax(cache, args.mathjax)
+    mathjax_src = find_mathjax(cache, args.mathjax, args.math)
     print(f"      MathJax: {mathjax_src}")
 
     print("[3/6] Layout pass (locating headings)")
@@ -948,7 +1017,8 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
     render_pdf(html_path, cache / "pass2.pdf", args.page_size, args.chromium)
 
     print("[5/6] Adding running headers, page numbers, bookmarks")
-    postprocess(cache / "pass2.pdf", Path(args.out), book, headings, chapters, positions)
+    postprocess(cache / "pass2.pdf", Path(args.out), book, headings, chapters, positions,
+                optimize_images=not args.no_image_optimization)
 
     print("[6/6] Verifying")
     problems = verify(Path(args.out), book, headings, page_numbers)

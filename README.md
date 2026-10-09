@@ -14,7 +14,7 @@ What you get:
 - All text, code (syntax highlighted, long lines wrapped rather than cut),
   code output, data-frame tables, figures, callouts, tabsets (every tab printed),
   footnotes and references
-- Math typeset with MathJax (vector SVG, sharp at any zoom)
+- Math typeset with MathJax using math fonts (sharp at any zoom, searchable)
 - Clickable cross-references, figure/section links and footnotes inside the PDF
 - PDF bookmarks (Part > Chapter > Section), running chapter headers, page numbers
 
@@ -29,6 +29,12 @@ python book_to_pdf.py                   # writes fpppy.pdf
 Options: `--page-size A4|Letter|A5`, `--toc-depth 1|2|3`, `--out FILE`, `--exclude` (website-only
 pages left out; default: translations, print-version, reviews, error),
 `--max-pages N` (quick trial), `--no-google-fonts`, `--chromium PATH`.
+File size: by default equations are drawn with fonts, charts are stored as
+256-colour images when that is visually identical (checked per image, PSNR of at
+least 45 dB), and the PDF is repacked losslessly. On a chart- and equation-heavy
+test book this cut the file from 4.5 MB to 1.4 MB. `--math svg` and
+`--no-image-optimization` restore the previous behaviour.
+
 Downloads are cached in `.book_cache/`, so re-runs are fast. Node/npm is used, if
 present, to install MathJax locally; otherwise it is loaded from jsDelivr.
 
