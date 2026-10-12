@@ -31,6 +31,8 @@ respect the book's copyright and licence.
 from __future__ import annotations
 
 import argparse
+import collections
+import dataclasses
 import hashlib
 import html
 import json
@@ -59,8 +61,33 @@ PLACEHOLDER_PAGE = "000"
 COVER_SELECTOR = 'img.quarto-cover-image, .cover img, img.cover, img[src*="cover"]'
 # Website-only pages that a printed book would not contain (matched on file name).
 DEFAULT_EXCLUDE = "translations.html,print-version.html,reviews.html,error.html"
-TOP_MARGIN_MM, BOTTOM_MARGIN_MM, SIDE_MARGIN_MM = 22, 20, 18
-TOP_MARGIN_PT, BOTTOM_MARGIN_PT = TOP_MARGIN_MM * 72 / 25.4, BOTTOM_MARGIN_MM * 72 / 25.4
+MM = 72 / 25.4  # points per millimetre
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Page geometry (mm) and a multiplier applied to every font size."""
+    width: float
+    height: float
+    top: float
+    bottom: float
+    side: float
+    font_scale: float = 1.0
+
+    @property
+    def content_height(self) -> float:
+        return self.height - self.top - self.bottom
+
+
+LAYOUTS = {
+    "A4": Layout(210, 297, 22, 20, 18),
+    "Letter": Layout(215.9, 279.4, 22, 20, 18),
+    "Legal": Layout(215.9, 355.6, 22, 20, 18),
+    "A5": Layout(148, 210, 16, 14, 12),
+    # 10.3" 4:3 e-ink tablets (Boox Note Air, reMarkable 2...): the screen is 210 x 157.5 mm,
+    # so this page is shown at 100% in portrait, and type is 10% larger than for A4.
+    "eink-10.3": Layout(157.5, 210, 14, 12, 9, 1.1),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -423,7 +450,7 @@ def rewrite_links(book: Book):
 # --------------------------------------------------------------------------- #
 
 CSS = r"""
-@page { size: %(page_size)s; margin: %(mt)smm %(ms)smm %(mb)smm %(ms)smm; }
+@page { size: %(pw)smm %(ph)smm; margin: %(mt)smm %(ms)smm %(mb)smm %(ms)smm; }
 :root {
   --ink: #1d1d1f; --muted: #5f6368; --rule: #d0d4d9; --accent: #1f4e79;
   --code-bg: #f6f8fa; --out-bg: #fbfbfb;
@@ -460,19 +487,19 @@ hr { border: 0; border-top: .6pt solid var(--rule); margin: 1.5em 0; }
 
 /* --- structure --- */
 .chapter { break-before: page; page-break-before: always; }
-.part-page { break-before: page; break-after: page; height: 230mm; display: flex;
+.part-page { break-before: page; break-after: page; height: %(part_h)smm; display: flex;
   flex-direction: column; justify-content: center; align-items: center; text-align: center; }
 .part-page .part-label { font-size: 13pt; letter-spacing: .25em; text-transform: uppercase; color: var(--muted); }
 .part-page h1 { border: 0; font-size: 28pt; margin: .4em 0 0; text-align: center; }
 .part-intro { break-before: auto; }
 
 /* --- cover --- */
-.cover { height: 240mm; display: flex; flex-direction: column; justify-content: center;
+.cover { height: %(cover_h)smm; display: flex; flex-direction: column; justify-content: center;
   align-items: center; text-align: center; break-after: page; }
 .cover .cover-title { font-size: 30pt; font-weight: 700; color: var(--accent); line-height: 1.15; margin: 0 0 .3em; }
 .cover .cover-subtitle { font-size: 15pt; color: var(--muted); margin: 0 0 1.4em; }
 .cover .cover-authors { font-size: 14pt; margin: 1em 0 2em; }
-.cover img { max-height: 120mm; max-width: 80%%; margin: 1em 0; box-shadow: 0 1mm 4mm rgba(0,0,0,.15); }
+.cover img { max-height: %(cover_img_h)smm; max-width: 80%%; margin: 1em 0; box-shadow: 0 1mm 4mm rgba(0,0,0,.15); }
 .cover .cover-source { font-size: 9pt; color: var(--muted); margin-top: 2em; }
 
 /* --- table of contents --- */
@@ -522,7 +549,7 @@ code span.ex { color: #8250df; }
 /* --- figures & tables --- */
 img, svg.figure, figure svg { max-width: 100%%; height: auto; }
 figure, .quarto-figure, .figure { margin: 1em 0; text-align: center; break-inside: avoid; page-break-inside: avoid; }
-figure img, .quarto-figure img, .cell-output-display img { max-height: 190mm; object-fit: contain; }
+figure img, .quarto-figure img, .cell-output-display img { max-height: %(fig_h)smm; object-fit: contain; }
 figcaption, .caption, caption, .figure-caption, .table-caption {
   font-size: 9pt; color: var(--muted); text-align: left; margin: .4em 0 .2em; line-height: 1.35; caption-side: top; }
 .quarto-layout-row { display: flex; gap: 4mm; justify-content: center; }
@@ -566,6 +593,19 @@ mjx-container svg { max-width: 100%%; }
 """
 
 
+def page_css(layout: Layout) -> str:
+    """Fill in the page geometry and scale every font size by layout.font_scale."""
+    css = CSS % {
+        "pw": layout.width, "ph": layout.height, "mt": layout.top, "mb": layout.bottom, "ms": layout.side,
+        "cover_h": round(layout.content_height - 6, 1), "part_h": round(layout.content_height - 10, 1),
+        "fig_h": round(layout.content_height * 0.7, 1), "cover_img_h": round(layout.content_height * 0.45, 1),
+    }
+    if layout.font_scale != 1.0:
+        css = re.sub(r"(font-size:\s*)([\d.]+)pt",
+                     lambda m: f"{m.group(1)}{float(m.group(2)) * layout.font_scale:.2f}pt", css)
+    return css
+
+
 def e(text: str) -> str:
     return html.escape(text, quote=True)
 
@@ -580,7 +620,7 @@ class Heading:
 
 
 def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers: dict[str, int],
-                  page_size: str, toc_depth: int, google_fonts: bool) -> tuple[str, list[Heading], list[tuple[str, str]]]:
+                  layout: Layout, toc_depth: int, google_fonts: bool) -> tuple[str, list[Heading], list[tuple[str, str]]]:
     """Return (html, headings, chapter_markers)."""
     headings: list[Heading] = []
     chapters: list[tuple[str, str]] = []  # (marker, running-header text)
@@ -700,7 +740,7 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
 <html lang="en"><head><meta charset="utf-8">
 <title>{e(book.title)}</title>
 {fonts}
-<style>{CSS % {"page_size": page_size, "mt": TOP_MARGIN_MM, "mb": BOTTOM_MARGIN_MM, "ms": SIDE_MARGIN_MM}}</style>
+<style>{page_css(layout)}</style>
 <script>window.MathJax = {json.dumps(mathjax_cfg)};</script>
 <script id="MathJax-script" src="{e(mathjax_src)}"></script>
 </head><body>
@@ -731,13 +771,37 @@ def find_mathjax(cache_dir: Path, explicit: str | None, mode: str = "chtml") -> 
     return MATHJAX_CDN.format(script=script)
 
 
-def render_pdf(html_path: Path, pdf_path: Path, page_size: str, chromium_path: str | None):
+FIT_WIDE_ELEMENTS_JS = """() => {
+  const limit = document.body.clientWidth;
+  const candidates = 'table, pre, mjx-container[display="true"], .quarto-layout-row, figure, svg, img, .cell-output-display > div';
+  let fitted = 0;
+  for (const el of document.querySelectorAll(candidates)) {
+    if (el.closest('[data-fitted]')) continue;              // an ancestor was already scaled
+    const width = Math.max(el.scrollWidth, el.getBoundingClientRect().width);
+    const left = el.getBoundingClientRect().left - document.body.getBoundingClientRect().left;
+    const room = limit - Math.max(0, left);
+    if (width <= room + 1) continue;
+    let z = room / width;
+    if (z < 0.6 && el.tagName === 'TABLE') {                 // very wide: let cells wrap first
+      el.querySelectorAll('th, td').forEach(c => { c.style.whiteSpace = 'normal'; });
+      z = Math.min(1, room / Math.max(el.scrollWidth, el.getBoundingClientRect().width));
+    }
+    if (z < 1) { el.style.zoom = z.toFixed(4); el.dataset.fitted = '1'; fitted++; }
+  }
+  return [fitted, Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth)];
+}"""
+
+
+def render_pdf(html_path: Path, pdf_path: Path, layout: Layout, chromium_path: str | None):
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         kwargs = {"executable_path": chromium_path} if chromium_path else {}
         browser = p.chromium.launch(**kwargs)
-        page = browser.new_page()
+        # Lay the page out at the printed text width, so wide elements can be found before printing.
+        content_px = round((layout.width - 2 * layout.side) / 25.4 * 96)
+        page = browser.new_page(viewport={"width": content_px, "height": 1200})
+        page.emulate_media(media="print")
         page.set_default_timeout(15 * 60 * 1000)
         page.goto(html_path.resolve().as_uri(), wait_until="load")
         page.wait_for_function("() => window.MathJax && MathJax.startup && MathJax.startup.promise")
@@ -747,12 +811,21 @@ def render_pdf(html_path: Path, pdf_path: Path, page_size: str, chromium_path: s
         errors = page.evaluate("() => document.querySelectorAll('mjx-merror, [data-mjx-error]').length")
         if errors:
             print(f"  WARNING: MathJax reported {errors} formula(s) it could not typeset")
-        page.pdf(path=str(pdf_path), format=page_size, print_background=True, prefer_css_page_size=True,
+        # If anything is wider than the page, Chromium shrinks the WHOLE document to fit
+        # (measured: 10.5 pt body text printed at 7 pt because of one wide table).
+        # Scale down only the elements that are too wide instead, as printed books do.
+        fitted, overflow = page.evaluate(FIT_WIDE_ELEMENTS_JS)
+        if fitted:
+            print(f"  scaled down {fitted} wide table(s)/block(s) to fit the page width")
+        if overflow > 1:
+            print(f"  WARNING: content still {overflow}px wider than the page; Chromium will shrink every page")
+        page.pdf(path=str(pdf_path), width=f"{layout.width}mm", height=f"{layout.height}mm",
+                 print_background=True, prefer_css_page_size=True,
                  display_header_footer=False)
         browser.close()
 
 
-def locate_markers(pdf_path: Path) -> dict[str, tuple[int, float]]:
+def locate_markers(pdf_path: Path, layout: Layout) -> dict[str, tuple[int, float]]:
     """Return marker -> (0-based page index, y position in points)."""
     import pymupdf as fitz
 
@@ -765,12 +838,12 @@ def locate_markers(pdf_path: Path) -> dict[str, tuple[int, float]]:
     found: dict[str, tuple[int, float]] = {}
     with fitz.open(pdf_path) as doc:
         for pno, page in enumerate(doc):
-            bottom_band = page.rect.height - BOTTOM_MARGIN_PT - 12
+            bottom_band = page.rect.height - layout.bottom * MM - 12
             for m in dict.fromkeys(re.findall(r"@@[PCH]\d{5}@@", re.sub(r"\s+", "", page.get_text()))):
                 hits = page.search_for(m)
                 y = min(r.y0 for r in hits) if hits else 0.0
                 if hits and y >= bottom_band and pno + 1 < len(doc):
-                    found[m] = (pno + 1, TOP_MARGIN_PT)
+                    found[m] = (pno + 1, layout.top * MM)
                 else:
                     found[m] = (pno, y)
     return found
@@ -831,7 +904,7 @@ def palettize_images(doc, min_psnr: float = 45.0) -> tuple[int, int]:
 
 def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading],
                 chapters: list[tuple[str, str]], positions: dict[str, tuple[int, float]],
-                optimize_images: bool = True):
+                layout: Layout, optimize_images: bool = True):
     import pymupdf as fitz
 
     doc = fitz.open(pdf_in)
@@ -850,30 +923,34 @@ def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading]
         running[i] = cur
 
     grey = (0.42, 0.44, 0.47)
+    side = layout.side * MM
+    hsize, fsize = 8.5 * layout.font_scale, 9 * layout.font_scale
+    head_y = layout.top * MM * 0.55  # header baseline sits a little above the middle of the top margin
+    foot_y = layout.bottom * MM * 0.45  # page number baseline, measured from the bottom edge
     for i, page in enumerate(doc):
         if i == 0:
             continue  # cover
         w, h = page.rect.width, page.rect.height
         num = str(i + 1)
-        tw = fitz.get_text_length(num, fontname="helv", fontsize=9)
-        page.insert_text(((w - tw) / 2, h - 28), num, fontname="helv", fontsize=9, color=grey)
+        tw = fitz.get_text_length(num, fontname="helv", fontsize=fsize)
+        page.insert_text(((w - tw) / 2, h - foot_y), num, fontname="helv", fontsize=fsize, color=grey)
         text = running[i]
         if text and i not in start_pages:
             text = text.encode("latin-1", "replace").decode("latin-1")
-            max_w = w - 2 * 51
-            while fitz.get_text_length(text + "...", fontname="helv", fontsize=8.5) > max_w and len(text) > 4:
+            max_w = w - 2 * side
+            while fitz.get_text_length(text + "...", fontname="helv", fontsize=hsize) > max_w and len(text) > 4:
                 text = text[:-1].rstrip()
-                if fitz.get_text_length(text + "...", fontname="helv", fontsize=8.5) <= max_w:
+                if fitz.get_text_length(text + "...", fontname="helv", fontsize=hsize) <= max_w:
                     text += "..."
                     break
             title = book.title.encode("latin-1", "replace").decode("latin-1")
-            if fitz.get_text_length(title, fontname="helv", fontsize=8.5) + fitz.get_text_length(text, fontname="helv", fontsize=8.5) > max_w - 20:
+            if fitz.get_text_length(title, fontname="helv", fontsize=hsize) + fitz.get_text_length(text, fontname="helv", fontsize=hsize) > max_w - 20:
                 title = ""
-            tw = fitz.get_text_length(text, fontname="helv", fontsize=8.5)
-            page.insert_text((w - 51 - tw, 40), text, fontname="helv", fontsize=8.5, color=grey)
+            tw = fitz.get_text_length(text, fontname="helv", fontsize=hsize)
+            page.insert_text((w - side - tw, head_y), text, fontname="helv", fontsize=hsize, color=grey)
             if title:
-                page.insert_text((51, 40), title, fontname="helv", fontsize=8.5, color=grey)
-            page.draw_line((51, 45), (w - 51, 45), color=(0.8, 0.82, 0.85), width=0.5)
+                page.insert_text((side, head_y), title, fontname="helv", fontsize=hsize, color=grey)
+            page.draw_line((side, head_y + 5), (w - side, head_y + 5), color=(0.8, 0.82, 0.85), width=0.5)
 
     # PDF outline (bookmarks) with exact vertical positions.
     toc = [[1, "Contents", 2]]
@@ -905,7 +982,11 @@ def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading]
 # --------------------------------------------------------------------------- #
 
 
-def verify(pdf_path: Path, book: Book, headings: list[Heading], page_numbers: dict[str, int]) -> list[str]:
+BODY_FONT_PT = 10.5  # must match "html { font-size }" in CSS
+
+
+def verify(pdf_path: Path, book: Book, headings: list[Heading], page_numbers: dict[str, int],
+           layout: Layout) -> list[str]:
     import pymupdf as fitz
 
     problems: list[str] = []
@@ -925,6 +1006,20 @@ def verify(pdf_path: Path, book: Book, headings: list[Heading], page_numbers: di
             page_text = re.sub(r"\s+", "", texts[idx]) if idx < len(texts) else ""
             if idx <= toc_last or probe not in page_text:
                 problems.append(f"heading '{hd.text}' not found on page {idx + 1}")
+        # The most common text size must be the body size: anything smaller means Chromium shrank the book.
+        sizes = collections.Counter()
+        for page in doc:
+            for block in page.get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    for span in line["spans"]:
+                        if not span["font"].startswith(("Type3", "Helvetica")):
+                            sizes[round(span["size"], 1)] += len(span["text"])
+        expected = BODY_FONT_PT * layout.font_scale
+        if sizes:
+            body = sizes.most_common(1)[0][0]
+            if abs(body - expected) > 0.03 * expected:
+                problems.append(f"body text printed at {body} pt instead of {expected:.1f} pt (page shrunk)")
+            print(f"  body text size: {body} pt (expected {expected:.1f} pt)")
         print(f"  final PDF: {len(doc)} pages, {len(doc.get_toc())} bookmarks, "
               f"{sum(len(p.get_images()) for p in doc)} image placements")
     return problems
@@ -940,7 +1035,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--url", default="https://otexts.com/fpppy/", help="book landing page")
     ap.add_argument("--out", default="fpppy.pdf", help="output PDF path")
     ap.add_argument("--cache-dir", default=".book_cache", help="where downloads and intermediate files go")
-    ap.add_argument("--page-size", default="A4", choices=["A4", "Letter", "A5", "Legal"])
+    ap.add_argument("--page-size", default="A4", choices=list(LAYOUTS),
+                    help="eink-10.3 matches 10.3-inch 4:3 e-ink tablets (Boox Note Air, reMarkable 2)")
+    ap.add_argument("--font-scale", type=float, default=None,
+                    help="multiply all font sizes (default: 1.0, or 1.1 for eink-10.3)")
     ap.add_argument("--toc-depth", type=int, default=2, choices=[1, 2, 3],
                     help="1 = chapters, 2 = + sections, 3 = + subsections")
     ap.add_argument("--delay", type=float, default=0.3, help="seconds between downloads")
@@ -986,6 +1084,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -> int:
+    layout = LAYOUTS[args.page_size]
+    if args.font_scale is not None:
+        layout = dataclasses.replace(layout, font_scale=args.font_scale)
     print("[2/6] Downloading and cleaning pages")
     if book.cover_img:
         local = fetcher.asset(book.cover_img)
@@ -999,29 +1100,29 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
     print(f"      MathJax: {mathjax_src}")
 
     print("[3/6] Layout pass (locating headings)")
-    html1, headings, chapters = assemble_html(book, mathjax_src, True, {}, args.page_size, args.toc_depth,
+    html1, headings, chapters = assemble_html(book, mathjax_src, True, {}, layout, args.toc_depth,
                                               not args.no_google_fonts)
     (cache / "book_pass1.html").write_text(html1, encoding="utf-8")
-    render_pdf(cache / "book_pass1.html", cache / "pass1.pdf", args.page_size, args.chromium)
-    positions = locate_markers(cache / "pass1.pdf")
+    render_pdf(cache / "book_pass1.html", cache / "pass1.pdf", layout, args.chromium)
+    positions = locate_markers(cache / "pass1.pdf", layout)
     missing = [h.text for h in headings if h.marker not in positions]
     if missing:
         print(f"  WARNING: {len(missing)} heading(s) not located, e.g. {missing[:3]}")
     page_numbers = {m: pos[0] + 1 for m, pos in positions.items()}
 
     print("[4/6] Final pass (with page numbers in the table of contents)")
-    html2, headings2, _ = assemble_html(book, mathjax_src, False, page_numbers, args.page_size, args.toc_depth,
+    html2, headings2, _ = assemble_html(book, mathjax_src, False, page_numbers, layout, args.toc_depth,
                                         not args.no_google_fonts)
     html_path = cache / "book.html"
     html_path.write_text(html2, encoding="utf-8")
-    render_pdf(html_path, cache / "pass2.pdf", args.page_size, args.chromium)
+    render_pdf(html_path, cache / "pass2.pdf", layout, args.chromium)
 
     print("[5/6] Adding running headers, page numbers, bookmarks")
-    postprocess(cache / "pass2.pdf", Path(args.out), book, headings, chapters, positions,
+    postprocess(cache / "pass2.pdf", Path(args.out), book, headings, chapters, positions, layout,
                 optimize_images=not args.no_image_optimization)
 
     print("[6/6] Verifying")
-    problems = verify(Path(args.out), book, headings, page_numbers)
+    problems = verify(Path(args.out), book, headings, page_numbers, layout)
     for p in problems[:20]:
         print(f"  WARNING: {p}")
     print(f"Done: {args.out}" + (" (with warnings)" if problems else ""))

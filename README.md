@@ -26,9 +26,14 @@ python -m playwright install chromium   # once
 python book_to_pdf.py                   # writes fpppy.pdf
 ```
 
-Options: `--page-size A4|Letter|A5`, `--toc-depth 1|2|3`, `--out FILE`, `--exclude` (website-only
+Options: `--page-size A4|Letter|A5|eink-10.3`, `--font-scale 1.2`, `--toc-depth 1|2|3`, `--out FILE`, `--exclude` (website-only
 pages left out; default: translations, print-version, reviews, error),
 `--max-pages N` (quick trial), `--no-google-fonts`, `--chromium PATH`.
+E-ink tablets: `--page-size eink-10.3` sizes the page to a 10.3-inch 4:3 screen
+(210 x 157.5 mm: Boox Note Air, reMarkable 2), so it is shown at 100% instead of
+being shrunk to about 71% like A4, with 10% larger type. Use `--font-scale` to
+go bigger or smaller.
+
 File size: by default equations are drawn with fonts, charts are stored as
 256-colour images when that is visually identical (checked per image, PSNR of at
 least 45 dB), and the PDF is repacked losslessly. On a chart- and equation-heavy
