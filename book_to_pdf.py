@@ -47,9 +47,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
+
+if TYPE_CHECKING:
+    import numpy as np
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -133,9 +137,10 @@ class BotChallengeError(RuntimeError):
 
 
 class Fetcher:
-    def __init__(self, cache_dir: Path, delay: float):
+    def __init__(self, cache_dir: Path, delay: float, grayscale: bool = False):
         self.cache_dir = cache_dir
         self.delay = delay
+        self.grayscale = grayscale
         (cache_dir / "pages").mkdir(parents=True, exist_ok=True)
         (cache_dir / "assets").mkdir(parents=True, exist_ok=True)
         self._asset_map: dict[str, str] = {}
@@ -189,8 +194,208 @@ class Fetcher:
                 print(f"  WARNING: could not download image {url}: {e}")
                 self._asset_map[url] = None
                 return None
+        if self.grayscale:
+            rel = to_grayscale_asset(self.cache_dir, rel)
         self._asset_map[url] = rel
         return rel
+
+
+# --------------------------------------------------------------------------- #
+# Grayscale for e-ink: keep chart series distinguishable
+# --------------------------------------------------------------------------- #
+#
+# A plain luminance conversion can give different colours the same grey: matplotlib's
+# default blue #1f77b4 and red #d62728 both land near L* 47. Instead, each image's
+# "key" colours (saturated, frequent, not a tint of another key) keep their
+# light-to-dark order but are spread over distinct steps of a 16-level e-ink screen
+# between L* 15 and 60 (dark enough to stay visible on white; widened towards lighter
+# greys only when a chart has more series than that range holds). Every other chromatic colour is explained as a blend
+# of a key with white (anti-aliased edges, translucent bands; matplotlib blends in
+# sRGB) and gets the same blend of that key's new grey, so shapes stay consistent.
+# Neutral colours (text, axes, grid) keep their luminance. Photos are converted to
+# plain luminance.
+
+KEY_LIGHTNESS = (15.0, 60.0)  # L* range for series colours
+MAX_KEYS = 12                 # more distinct hues than this = a continuous colour map
+PHOTO_COLOURS = 30000         # more distinct colours than this = a photograph
+
+
+def _lab(srgb: "np.ndarray") -> "np.ndarray":
+    """sRGB in 0..1 (n, 3) -> CIE L*a*b* (D65)."""
+    import numpy as np
+
+    lin = np.where(srgb <= 0.04045, srgb / 12.92, ((srgb + 0.055) / 1.055) ** 2.4)
+    xyz = lin @ np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]).T
+    xyz /= np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+    return np.stack([116 * f[:, 1] - 16, 500 * (f[:, 0] - f[:, 1]), 200 * (f[:, 1] - f[:, 2])], axis=1)
+
+
+def _grey_from_lstar(lstar: float) -> float:
+    """CIE L* -> sRGB grey level in 0..1."""
+    y = ((lstar + 16) / 116) ** 3 if lstar > 8 else lstar / 903.3
+    return 12.92 * y if y <= 0.0031308 else 1.055 * y ** (1 / 2.4) - 0.055
+
+
+def _tint_of(c: "np.ndarray", key: "np.ndarray", base: "np.ndarray | float" = 1.0) -> tuple[float, float]:
+    """Express colour c as alpha*key + (1-alpha)*base (sRGB 0..1, base defaults to white).
+
+    Returns (alpha, residual distance)."""
+    import numpy as np
+
+    d = key - base
+    denom = float(d @ d)
+    if denom < 1e-9:
+        return 0.0, 1.0
+    alpha = float(np.clip((c - base) @ d / denom, 0.0, 1.0))
+    return alpha, float(np.linalg.norm(c - (alpha * key + (1 - alpha) * base)))
+
+
+def grey_levels(colours: "np.ndarray", counts: "np.ndarray | None" = None) -> "np.ndarray":
+    """Map distinct sRGB colours (n, 3; uint8) to grey levels (n,; uint8)."""
+    import numpy as np
+
+    srgb = colours.astype(float) / 255
+    lab = _lab(srgb)
+    lightness, chroma = lab[:, 0], np.hypot(lab[:, 1], lab[:, 2])
+    out = np.array([_grey_from_lstar(v) for v in lightness])  # neutral colours keep their lightness
+    chromatic = np.where(chroma >= 12)[0]
+    if len(chromatic) == 0:
+        return np.round(out * 255).astype(np.uint8)
+
+    # Key colours: most saturated first, frequent enough, not a tint of an earlier key.
+    min_count = 0 if counts is None else max(20, 0.0005 * counts.sum())
+    keys: list[int] = []
+    for i in sorted(chromatic, key=lambda i: -chroma[i]):
+        if counts is not None and counts[i] < min_count:
+            continue
+        if any(_tint_of(srgb[i], srgb[k])[1] < 0.03 for k in keys):
+            continue
+        keys.append(i)
+        if len(keys) > MAX_KEYS:
+            return np.round(out * 255).astype(np.uint8)  # continuous colour map: luminance order is right
+    if not keys:
+        return np.round(out * 255).astype(np.uint8)
+
+    ordered = sorted(keys, key=lambda k: lightness[k])
+    if len(ordered) == 1:  # a lone light colour (e.g. yellow) must stay visible
+        key_grey = {ordered[0]: _grey_from_lstar(min(lightness[ordered[0]], 45.0))}
+    else:
+        # Pick distinct steps of a 16-level e-ink screen inside the L* range (widened towards
+        # lighter greys if there are more series than steps), so no two series render identically.
+        steps = np.arange(16) * 17 / 255
+        step_l = _lab(np.repeat(steps[:, None], 3, axis=1))[:, 0]
+        # Steps already taken by prominent neutral mid-greys (e.g. a grey series line) are reserved.
+        neutral = [i for i in range(len(srgb)) if chroma[i] < 12 and 20 <= lightness[i] <= 80
+                   and (counts is None or counts[i] >= min_count)]
+        taken = {int(round(out[i] * 15)) for i in neutral}
+        free = np.array([k not in taken for k in range(16)])
+        low, high = KEY_LIGHTNESS
+        usable = steps[(step_l >= low) & (step_l <= high) & free]
+        while len(usable) < len(ordered) and high < 85:
+            high += 5
+            usable = steps[(step_l >= low) & (step_l <= high) & free]
+        picks = usable[np.round(np.linspace(0, len(usable) - 1, len(ordered))).astype(int)]
+        key_grey = dict(zip(ordered, picks))
+
+    for k in keys:
+        out[k] = key_grey[k]
+    # Pass 1: tints of a key over white (anti-aliased edges, translucent bands on white).
+    pending = []
+    for i in chromatic:
+        if i in key_grey:
+            continue
+        fits = [(_tint_of(srgb[i], srgb[k]), k) for k in keys]
+        (alpha, residual), k = min(fits, key=lambda f: f[0][1])
+        if residual < 0.03:
+            out[i] = alpha * key_grey[k] + (1 - alpha)  # same blend with white as in the original
+        else:
+            pending.append(i)
+    # Pass 2: a key blended over another frequent colour (a line crossing a shaded band).
+    if counts is not None:
+        frequent = [j for j in np.argsort(-counts)[:12] if j not in pending]
+    else:
+        frequent = [j for j in range(len(srgb)) if j not in pending]
+    for i in pending:
+        best = None
+        for k in keys:
+            for j in frequent:
+                if j == k:
+                    continue
+                alpha, residual = _tint_of(srgb[i], srgb[k], srgb[j])
+                if best is None or residual < best[0]:
+                    best = (residual, alpha * key_grey[k] + (1 - alpha) * out[j])
+        if best is not None and best[0] < 0.05:
+            out[i] = best[1]
+        else:  # unexplained colour: take the grey of the perceptually nearest key
+            nearest = min(keys, key=lambda k: float(np.linalg.norm(lab[i] - lab[k])))
+            out[i] = key_grey[nearest]
+    return np.round(np.clip(out, 0, 1) * 255).astype(np.uint8)
+
+
+def grayscale_image(src: Path, dst: Path) -> None:
+    """Write a smart greyscale copy of a raster image (PNG keeps transparency)."""
+    import numpy as np
+    from PIL import Image
+
+    im = Image.open(src)
+    im.load()
+    alpha = im.getchannel("A") if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info else None
+    rgb = np.asarray(im.convert("RGB")).reshape(-1, 3)
+    colours, inverse, counts = np.unique(rgb, axis=0, return_inverse=True, return_counts=True)
+    if len(colours) > PHOTO_COLOURS:
+        grey = np.asarray(im.convert("RGB").convert("L"))
+    else:
+        grey = grey_levels(colours, counts)[inverse.reshape(-1)].reshape(im.height, im.width)
+    out = Image.fromarray(grey, "L")
+    if alpha is not None:
+        out = Image.merge("LA", (out, alpha.convert("L")))
+    out.save(dst, "PNG" if dst.suffix == ".png" else "JPEG", **({"optimize": True} if dst.suffix == ".png" else {"quality": 90}))
+
+
+_SVG_COLOUR = re.compile(r"#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b|rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)")
+
+
+def _parse_colour(text: str) -> tuple[int, int, int]:
+    if text.startswith("rgb"):
+        return tuple(int(v) for v in re.findall(r"\d+", text))  # type: ignore[return-value]
+    h = text[1:]
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def grayscale_svg(src: Path, dst: Path) -> None:
+    """Rewrite every colour in an SVG with the same key-colour mapping as raster charts."""
+    import numpy as np
+
+    text = src.read_text(encoding="utf-8", errors="replace")
+    found = sorted(set(_SVG_COLOUR.findall(text)))
+    if not found:
+        dst.write_text(text, encoding="utf-8")
+        return
+    rgb = sorted({_parse_colour(c) for c in found})
+    greys = dict(zip(rgb, grey_levels(np.array(rgb, dtype=np.uint8))))
+    text = _SVG_COLOUR.sub(lambda m: "#{0:02x}{0:02x}{0:02x}".format(int(greys[_parse_colour(m.group(0))])), text)
+    dst.write_text(text, encoding="utf-8")
+
+
+def to_grayscale_asset(cache_dir: Path, rel: str) -> str:
+    """Return the cached greyscale version of an asset, creating it on first use."""
+    src = cache_dir / rel
+    ext = src.suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"):
+        return rel
+    out_ext = ext if ext in (".png", ".jpg", ".jpeg", ".svg") else ".png"
+    out_rel = f"{rel.rsplit('.', 1)[0]}.grey{out_ext}"
+    dst = cache_dir / out_rel
+    if not dst.exists():
+        try:
+            (grayscale_svg if ext == ".svg" else grayscale_image)(src, dst)
+        except Exception as err:  # keep the colour image rather than lose it
+            print(f"  note: {rel} kept in colour ({err})")
+            return rel
+    return out_rel
 
 
 # --------------------------------------------------------------------------- #
@@ -593,13 +798,42 @@ mjx-container svg { max-width: 100%%; }
 """
 
 
-def page_css(layout: Layout) -> str:
+# E-ink: every text colour becomes black (coloured text turns into low-contrast grey),
+# syntax highlighting uses bold/italic like Pandoc's "monochrome" style, and faint
+# tinted backgrounds become black rules, which survive a 16-level grey screen.
+GRAYSCALE_CSS = r"""
+:root { --ink: #000; --muted: #222; --rule: #777; --accent: #000; --code-bg: #fff; --out-bg: #fff; }
+a { color: #000; text-decoration: underline; text-decoration-thickness: .4pt; text-underline-offset: .15em; }
+.toc a, .toc .lvl-part a, .toc .lvl-sec a, a.footnote-ref, a[role="doc-noteref"] { text-decoration: none; color: #000; }
+.toc .dots { border-bottom-color: #444; }
+code { background: none; padding: 0; }
+pre { background: #fff; border: .8pt solid #000; }
+.cell-output pre, .cell-output-stdout pre, .cell-output-stderr pre, pre.output, .output pre {
+  background: #fff; border: 0; border-left: 2.5pt solid #000; }
+.cell-output-stderr pre { border-left-style: dashed; }
+code span { color: #000 !important; }
+code span.kw, code span.cf, code span.im, code span.bu, code span.dt { font-weight: bold; }
+code span.co, code span.do, code span.an, code span.cv, code span.in { font-style: italic; }
+.callout, .callout.callout-tip, .callout.callout-warning, .callout.callout-important, .callout.callout-caution {
+  background: #fff; border: .8pt solid #000; border-left: 4pt solid #000; }
+.callout .callout-header { background: #fff !important; border-bottom: .6pt solid #000; }
+.callout-warning, .callout-important, .callout-caution { border-left-style: double; border-left-width: 5pt; }
+th, td { border-bottom-color: #888; }
+thead th { border-bottom-color: #000; }
+blockquote { border-left-color: #000; color: #000; }
+.cover img { box-shadow: none; border: .6pt solid #000; }
+"""
+
+
+def page_css(layout: Layout, grayscale: bool = False) -> str:
     """Fill in the page geometry and scale every font size by layout.font_scale."""
     css = CSS % {
         "pw": layout.width, "ph": layout.height, "mt": layout.top, "mb": layout.bottom, "ms": layout.side,
         "cover_h": round(layout.content_height - 6, 1), "part_h": round(layout.content_height - 10, 1),
         "fig_h": round(layout.content_height * 0.7, 1), "cover_img_h": round(layout.content_height * 0.45, 1),
     }
+    if grayscale:
+        css += GRAYSCALE_CSS
     if layout.font_scale != 1.0:
         css = re.sub(r"(font-size:\s*)([\d.]+)pt",
                      lambda m: f"{m.group(1)}{float(m.group(2)) * layout.font_scale:.2f}pt", css)
@@ -620,7 +854,7 @@ class Heading:
 
 
 def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers: dict[str, int],
-                  layout: Layout, toc_depth: int, google_fonts: bool) -> tuple[str, list[Heading], list[tuple[str, str]]]:
+                  layout: Layout, toc_depth: int, google_fonts: bool, grayscale: bool = False) -> tuple[str, list[Heading], list[tuple[str, str]]]:
     """Return (html, headings, chapter_markers)."""
     headings: list[Heading] = []
     chapters: list[tuple[str, str]] = []  # (marker, running-header text)
@@ -740,7 +974,7 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
 <html lang="en"><head><meta charset="utf-8">
 <title>{e(book.title)}</title>
 {fonts}
-<style>{page_css(layout)}</style>
+<style>{page_css(layout, grayscale)}</style>
 <script>window.MathJax = {json.dumps(mathjax_cfg)};</script>
 <script id="MathJax-script" src="{e(mathjax_src)}"></script>
 </head><body>
@@ -879,7 +1113,18 @@ def palettize_images(doc, min_psnr: float = 45.0) -> tuple[int, int]:
                 pix = fitz.Pixmap(doc, xref)
                 if pix.n != 3 or pix.alpha:
                     continue
-                rgb = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                samples = pix.samples
+                if samples[0::3] == samples[1::3] == samples[2::3]:  # grey image: one channel is enough
+                    old_size = len(doc.xref_stream_raw(xref))
+                    smask = doc.xref_get_key(xref, "SMask")
+                    doc.update_object(xref, f"<< /Type /XObject /Subtype /Image /Width {pix.width} /Height {pix.height} "
+                                            f"/ColorSpace /DeviceGray /BitsPerComponent 8"
+                                            + (f" /SMask {smask[1]}" if smask[0] == "xref" else "") + " >>")
+                    doc.update_stream(xref, samples[0::3], compress=True)
+                    replaced += 1
+                    saved += old_size - len(doc.xref_stream_raw(xref))
+                    continue
+                rgb = Image.frombytes("RGB", (pix.width, pix.height), samples)
                 pal = rgb.quantize(256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
                 mse = sum(ImageStat.Stat(ImageChops.difference(rgb, pal.convert("RGB"))).sum2) / (3 * rgb.width * rgb.height)
                 if mse and 10 * math.log10(255**2 / mse) < min_psnr:
@@ -904,7 +1149,7 @@ def palettize_images(doc, min_psnr: float = 45.0) -> tuple[int, int]:
 
 def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading],
                 chapters: list[tuple[str, str]], positions: dict[str, tuple[int, float]],
-                layout: Layout, optimize_images: bool = True):
+                layout: Layout, optimize_images: bool = True, grayscale: bool = False):
     import pymupdf as fitz
 
     doc = fitz.open(pdf_in)
@@ -922,7 +1167,8 @@ def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading]
             nxt = next(it)
         running[i] = cur
 
-    grey = (0.42, 0.44, 0.47)
+    grey = (0.15, 0.15, 0.15) if grayscale else (0.42, 0.44, 0.47)
+    rule = (0.35, 0.35, 0.35) if grayscale else (0.8, 0.82, 0.85)
     side = layout.side * MM
     hsize, fsize = 8.5 * layout.font_scale, 9 * layout.font_scale
     head_y = layout.top * MM * 0.55  # header baseline sits a little above the middle of the top margin
@@ -950,7 +1196,7 @@ def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading]
             page.insert_text((w - side - tw, head_y), text, fontname="helv", fontsize=hsize, color=grey)
             if title:
                 page.insert_text((side, head_y), title, fontname="helv", fontsize=hsize, color=grey)
-            page.draw_line((side, head_y + 5), (w - side, head_y + 5), color=(0.8, 0.82, 0.85), width=0.5)
+            page.draw_line((side, head_y + 5), (w - side, head_y + 5), color=rule, width=0.5)
 
     # PDF outline (bookmarks) with exact vertical positions.
     toc = [[1, "Contents", 2]]
@@ -971,7 +1217,7 @@ def postprocess(pdf_in: Path, pdf_out: Path, book: Book, headings: list[Heading]
     })
     if optimize_images:
         n, saved = palettize_images(doc)
-        print(f"  images: {n} stored as 256-colour (visually identical), {saved / 1e6:.1f} MB saved")
+        print(f"  images: {n} stored compactly (grey or 256-colour, visually identical), {saved / 1e6:.1f} MB saved")
     # Lossless: drop unused/duplicate objects, compress everything, pack small objects into streams.
     doc.save(pdf_out, garbage=4, deflate=True, deflate_images=True, deflate_fonts=True, use_objstms=1)
     doc.close()
@@ -1046,6 +1292,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mathjax", default=None, help="path or URL of a MathJax tex-chtml.js / tex-svg.js")
     ap.add_argument("--math", default="chtml", choices=["chtml", "svg"],
                     help="chtml: math drawn with fonts (smaller, searchable); svg: vector outlines")
+    ap.add_argument("--grayscale", action="store_true",
+                    help="e-ink output: black text, bold/italic code highlighting, charts converted to grey "
+                         "with series colours spread apart so they stay distinguishable")
     ap.add_argument("--no-image-optimization", action="store_true",
                     help="keep images in full colour (skip the visually identical 256-colour conversion)")
     ap.add_argument("--chromium", default=None, help="path to a Chromium executable")
@@ -1057,7 +1306,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = args.url if args.url.endswith(("/", ".html")) else args.url + "/"
     cache = Path(args.cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
-    fetcher = Fetcher(cache, args.delay)
+    fetcher = Fetcher(cache, args.delay, grayscale=args.grayscale)
 
     print(f"[1/6] Reading table of contents from {base_url}")
     try:
@@ -1101,7 +1350,7 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
 
     print("[3/6] Layout pass (locating headings)")
     html1, headings, chapters = assemble_html(book, mathjax_src, True, {}, layout, args.toc_depth,
-                                              not args.no_google_fonts)
+                                              not args.no_google_fonts, args.grayscale)
     (cache / "book_pass1.html").write_text(html1, encoding="utf-8")
     render_pdf(cache / "book_pass1.html", cache / "pass1.pdf", layout, args.chromium)
     positions = locate_markers(cache / "pass1.pdf", layout)
@@ -1112,14 +1361,14 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
 
     print("[4/6] Final pass (with page numbers in the table of contents)")
     html2, headings2, _ = assemble_html(book, mathjax_src, False, page_numbers, layout, args.toc_depth,
-                                        not args.no_google_fonts)
+                                        not args.no_google_fonts, args.grayscale)
     html_path = cache / "book.html"
     html_path.write_text(html2, encoding="utf-8")
     render_pdf(html_path, cache / "pass2.pdf", layout, args.chromium)
 
     print("[5/6] Adding running headers, page numbers, bookmarks")
     postprocess(cache / "pass2.pdf", Path(args.out), book, headings, chapters, positions, layout,
-                optimize_images=not args.no_image_optimization)
+                optimize_images=not args.no_image_optimization, grayscale=args.grayscale)
 
     print("[6/6] Verifying")
     problems = verify(Path(args.out), book, headings, page_numbers, layout)

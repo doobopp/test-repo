@@ -34,6 +34,12 @@ E-ink tablets: `--page-size eink-10.3` sizes the page to a 10.3-inch 4:3 screen
 being shrunk to about 71% like A4, with 10% larger type. Use `--font-scale` to
 go bigger or smaller.
 
+Black-and-white e-ink: `--grayscale` makes all text black (code highlighting becomes
+bold keywords and italic comments) and converts charts to grey so that series stay
+distinguishable: each chart's series colours keep their light-to-dark order but get
+distinct steps of a 16-level e-ink screen, instead of the plain luminance that can
+give different colours the same grey (e.g. matplotlib's default blue and red).
+
 File size: by default equations are drawn with fonts, charts are stored as
 256-colour images when that is visually identical (checked per image, PSNR of at
 least 45 dB), and the PDF is repacked losslessly. On a chart- and equation-heavy
