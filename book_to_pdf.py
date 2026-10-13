@@ -206,16 +206,14 @@ class Fetcher:
 #
 # A plain luminance conversion can give different colours the same grey: matplotlib's
 # default blue #1f77b4 and red #d62728 both land near L* 47. Instead, each image's
-# "key" colours (saturated, frequent, not a tint of another key) keep their
-# light-to-dark order but are spread over distinct steps of a 16-level e-ink screen
-# between L* 15 and 60 (dark enough to stay visible on white; widened towards lighter
-# greys only when a chart has more series than that range holds). Every other chromatic colour is explained as a blend
+# "key" colours (saturated, frequent, not a tint of another key) keep their own
+# lightness as far as possible and are only moved apart when two of them would land
+# on the same step of a 16-level e-ink screen, keeping their light-to-dark order. Every other chromatic colour is explained as a blend
 # of a key with white (anti-aliased edges, translucent bands; matplotlib blends in
 # sRGB) and gets the same blend of that key's new grey, so shapes stay consistent.
 # Neutral colours (text, axes, grid) keep their luminance. Photos are converted to
 # plain luminance.
 
-KEY_LIGHTNESS = (15.0, 60.0)  # L* range for series colours
 MAX_KEYS = 12                 # more distinct hues than this = a continuous colour map
 PHOTO_COLOURS = 30000         # more distinct colours than this = a photograph
 
@@ -251,8 +249,56 @@ def _tint_of(c: "np.ndarray", key: "np.ndarray", base: "np.ndarray | float" = 1.
     return alpha, float(np.linalg.norm(c - (alpha * key + (1 - alpha) * base)))
 
 
-def grey_levels(colours: "np.ndarray", counts: "np.ndarray | None" = None) -> "np.ndarray":
-    """Map distinct sRGB colours (n, 3; uint8) to grey levels (n,; uint8)."""
+MARK_AREA = 0.02       # a series colour covering less of the image than this is a line/marker
+MARK_CONTRAST = 25.0   # lines/markers stay at least this much L* darker than the background
+
+
+def _assign_steps(keys: list, free: list, cost, allowed) -> dict | None:
+    """Give each key its own grey step, changing lightness as little as possible.
+
+    First tries to keep the keys' light-to-dark order (exact dynamic programme over
+    keys x steps, minimising the total lightness change); if no ordered assignment
+    satisfies `allowed`, places the most constrained keys first without the order.
+    Returns {key: step} or None when the keys cannot all get an allowed step.
+    """
+    inf = float("inf")
+    n, m = len(keys), len(free)
+    best = [[inf] * m for _ in range(n)]
+    back = [[-1] * m for _ in range(n)]
+    for i, k in enumerate(keys):
+        for j, st in enumerate(free):
+            if not allowed(k, st):
+                continue
+            c = cost(k, st)
+            if i == 0:
+                best[i][j] = c
+                continue
+            prev = min(range(j), key=lambda jj: best[i - 1][jj], default=None)
+            if prev is not None and best[i - 1][prev] < inf:
+                best[i][j], back[i][j] = best[i - 1][prev] + c, prev
+    end = min(range(m), key=lambda j: best[n - 1][j]) if m else None
+    if end is not None and best[n - 1][end] < inf:
+        out, j = {}, end
+        for i in range(n - 1, -1, -1):
+            out[keys[i]] = free[j]
+            j = back[i][j]
+        return out
+    # No ordered solution: most constrained keys first, each to its nearest allowed free step.
+    out, left = {}, list(free)
+    for k in sorted(keys, key=lambda k: sum(allowed(k, st) for st in free)):
+        options = [st for st in left if allowed(k, st)]
+        if not options:
+            return None
+        out[k] = min(options, key=lambda st: cost(k, st))
+        left.remove(out[k])
+    return out
+
+
+def grey_levels(colours: "np.ndarray", counts: "np.ndarray | None" = None,
+                report: dict | None = None) -> "np.ndarray":
+    """Map distinct sRGB colours (n, 3; uint8) to grey levels (n,; uint8).
+
+    If `report` is given, it receives the indices of the series ("key") colours found."""
     import numpy as np
 
     srgb = colours.astype(float) / 255
@@ -263,41 +309,57 @@ def grey_levels(colours: "np.ndarray", counts: "np.ndarray | None" = None) -> "n
     if len(chromatic) == 0:
         return np.round(out * 255).astype(np.uint8)
 
-    # Key colours: most saturated first, frequent enough, not a tint of an earlier key.
+    # Backgrounds a colour can be blended over: white plus frequent neutral colours
+    # (e.g. ggplot's grey panel, where line edges are blends with the panel, not with white).
     min_count = 0 if counts is None else max(20, 0.0005 * counts.sum())
+    backgrounds: list = [1.0]
+    if counts is not None:
+        neutral_bg = [j for j in np.argsort(-counts) if chroma[j] < 6 and lightness[j] > 60
+                      and counts[j] >= 0.01 * counts.sum()][:3]
+        backgrounds += [srgb[j] for j in neutral_bg]
+
+    def tint(c, key):  # best (alpha, residual, background) over all backgrounds
+        return min(((*_tint_of(c, key, bg), bg) for bg in backgrounds), key=lambda f: f[1])
+
+    # Key colours: most saturated first, frequent enough, not a tint of an earlier key.
     keys: list[int] = []
     for i in sorted(chromatic, key=lambda i: -chroma[i]):
         if counts is not None and counts[i] < min_count:
             continue
-        if any(_tint_of(srgb[i], srgb[k])[1] < 0.03 for k in keys):
+        if any(tint(srgb[i], srgb[k])[1] < 0.03 for k in keys):
             continue
         keys.append(i)
         if len(keys) > MAX_KEYS:
             return np.round(out * 255).astype(np.uint8)  # continuous colour map: luminance order is right
+    if report is not None:
+        report["keys"] = list(keys)
     if not keys:
         return np.round(out * 255).astype(np.uint8)
 
+    # Keep each key's own lightness as far as possible (light fills stay light, so dark
+    # labels on them stay readable) while giving every key its own step of a 16-level
+    # screen (see _assign_steps). Steps used by prominent neutral greys (e.g. a grey
+    # series line) are reserved.
     ordered = sorted(keys, key=lambda k: lightness[k])
-    if len(ordered) == 1:  # a lone light colour (e.g. yellow) must stay visible
-        key_grey = {ordered[0]: _grey_from_lstar(min(lightness[ordered[0]], 45.0))}
-    else:
-        # Pick distinct steps of a 16-level e-ink screen inside the L* range (widened towards
-        # lighter greys if there are more series than steps), so no two series render identically.
-        steps = np.arange(16) * 17 / 255
-        step_l = _lab(np.repeat(steps[:, None], 3, axis=1))[:, 0]
-        # Steps already taken by prominent neutral mid-greys (e.g. a grey series line) are reserved.
-        neutral = [i for i in range(len(srgb)) if chroma[i] < 12 and 20 <= lightness[i] <= 80
-                   and (counts is None or counts[i] >= min_count)]
-        taken = {int(round(out[i] * 15)) for i in neutral}
-        free = np.array([k not in taken for k in range(16)])
-        low, high = KEY_LIGHTNESS
-        usable = steps[(step_l >= low) & (step_l <= high) & free]
-        while len(usable) < len(ordered) and high < 85:
-            high += 5
-            usable = steps[(step_l >= low) & (step_l <= high) & free]
-        picks = usable[np.round(np.linspace(0, len(usable) - 1, len(ordered))).astype(int)]
-        key_grey = dict(zip(ordered, picks))
+    steps = np.arange(16) * 17 / 255
+    step_l = _lab(np.repeat(steps[:, None], 3, axis=1))[:, 0]
+    neutral = [i for i in range(len(srgb)) if chroma[i] < 12 and 20 <= lightness[i] <= 80
+               and (counts is None or counts[i] >= min_count)]
+    taken = {int(round(out[i] * 15)) for i in neutral}
+    free = [k for k in range(1, 15) if k not in taken]  # never pure black or white for a series
+    # Lines and markers (small area) must contrast with the background they sit on
+    # (white, or e.g. ggplot's grey panel); large fills such as map regions may stay light.
+    bg_l = 100.0 if counts is None else float(lightness[int(np.argmax(counts))])
+    total = None if counts is None else float(counts.sum())
 
+    def allowed(k: int, st: int) -> bool:
+        is_mark = total is None or counts[k] < MARK_AREA * total
+        return not is_mark or step_l[st] <= bg_l - MARK_CONTRAST
+
+    assignment = _assign_steps(ordered, free, lambda k, st: abs(step_l[st] - lightness[k]), allowed)
+    if assignment is None:
+        return np.round(out * 255).astype(np.uint8)  # cannot separate safely: keep luminance
+    key_grey = {k: steps[st] for k, st in assignment.items()}
     for k in keys:
         out[k] = key_grey[k]
     # Pass 1: tints of a key over white (anti-aliased edges, translucent bands on white).
@@ -305,10 +367,11 @@ def grey_levels(colours: "np.ndarray", counts: "np.ndarray | None" = None) -> "n
     for i in chromatic:
         if i in key_grey:
             continue
-        fits = [(_tint_of(srgb[i], srgb[k]), k) for k in keys]
-        (alpha, residual), k = min(fits, key=lambda f: f[0][1])
+        fits = [(tint(srgb[i], srgb[k]), k) for k in keys]
+        (alpha, residual, bg), k = min(fits, key=lambda f: f[0][1])
         if residual < 0.03:
-            out[i] = alpha * key_grey[k] + (1 - alpha)  # same blend with white as in the original
+            bg_grey = 1.0 if np.isscalar(bg) else _grey_from_lstar(float(_lab(np.array([bg]))[0, 0]))
+            out[i] = alpha * key_grey[k] + (1 - alpha) * bg_grey  # same blend as in the original
         else:
             pending.append(i)
     # Pass 2: a key blended over another frequent colour (a line crossing a shaded band).
@@ -854,7 +917,7 @@ class Heading:
 
 
 def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers: dict[str, int],
-                  layout: Layout, toc_depth: int, google_fonts: bool, grayscale: bool = False) -> tuple[str, list[Heading], list[tuple[str, str]]]:
+                  layout: Layout, toc_depth: int, fonts_css: str, grayscale: bool = False) -> tuple[str, list[Heading], list[tuple[str, str]]]:
     """Return (html, headings, chapter_markers)."""
     headings: list[Heading] = []
     chapters: list[tuple[str, str]] = []  # (marker, running-header text)
@@ -953,11 +1016,7 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
     body.append("".join(toc))
     body.extend(chapter_html)
 
-    fonts = (
-        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700'
-        '&family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;700&display=block">'
-        if google_fonts else ""
-    )
+    fonts = f"<style>{fonts_css}</style>" if fonts_css else ""
     mathjax_cfg = {
         "tex": {
             "inlineMath": [["\\(", "\\)"]],
@@ -986,6 +1045,40 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
+
+
+GOOGLE_FONTS_CSS = ("https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700"
+                    "&family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;700"
+                    "&display=block")
+
+
+def local_fonts_css(fetcher: "Fetcher") -> str:
+    """Download the book fonts once and return @font-face rules pointing at the local files.
+
+    Chromium does not always reach the web (proxies, offline runs), and a font that fails
+    to load silently falls back to whatever is installed. Plain TrueType files are
+    requested (Google serves them to this user agent) so Chromium can embed real,
+    searchable fonts in the PDF.
+    """
+    try:
+        req = urllib.request.Request(GOOGLE_FONTS_CSS, headers={"User-Agent": "Mozilla/5.0 Chrome/141"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            css = resp.read().decode("utf-8")
+        (fetcher.cache_dir / "fonts").mkdir(exist_ok=True)
+
+        def localise(m: re.Match) -> str:
+            url = m.group(1)
+            name = "fonts/" + hashlib.sha1(url.encode()).hexdigest()[:16] + Path(urlparse(url).path).suffix
+            path = fetcher.cache_dir / name
+            if not path.exists():
+                path.write_bytes(fetcher._get(url))
+            return f"url({name})"
+
+        css = re.sub(r"url\((https://[^)]+)\)", localise, css)
+        return css if "@font-face" in css else ""
+    except Exception as err:  # fall back to installed fonts rather than fail
+        print(f"  note: web fonts unavailable ({err}); using installed fonts")
+        return ""
 
 
 def find_mathjax(cache_dir: Path, explicit: str | None, mode: str = "chtml") -> str:
@@ -1346,11 +1439,13 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
     rewrite_links(book)
 
     mathjax_src = find_mathjax(cache, args.mathjax, args.math)
+    fonts_css = "" if args.no_google_fonts else local_fonts_css(fetcher)
+    print(f"      fonts: {'Source Serif 4 / Source Sans 3 / JetBrains Mono (local copies)' if fonts_css else 'installed fonts'}")
     print(f"      MathJax: {mathjax_src}")
 
     print("[3/6] Layout pass (locating headings)")
     html1, headings, chapters = assemble_html(book, mathjax_src, True, {}, layout, args.toc_depth,
-                                              not args.no_google_fonts, args.grayscale)
+                                              fonts_css, args.grayscale)
     (cache / "book_pass1.html").write_text(html1, encoding="utf-8")
     render_pdf(cache / "book_pass1.html", cache / "pass1.pdf", layout, args.chromium)
     positions = locate_markers(cache / "pass1.pdf", layout)
@@ -1361,7 +1456,7 @@ def build(args: argparse.Namespace, book: Book, fetcher: Fetcher, cache: Path) -
 
     print("[4/6] Final pass (with page numbers in the table of contents)")
     html2, headings2, _ = assemble_html(book, mathjax_src, False, page_numbers, layout, args.toc_depth,
-                                        not args.no_google_fonts, args.grayscale)
+                                        fonts_css, args.grayscale)
     html_path = cache / "book.html"
     html_path.write_text(html2, encoding="utf-8")
     render_pdf(html_path, cache / "pass2.pdf", layout, args.chromium)
