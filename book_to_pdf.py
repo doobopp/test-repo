@@ -638,6 +638,19 @@ def prepare_page(page: Page, raw_html: str, book: Book, fetcher: Fetcher, is_ind
                 lab.string = labels[i]
                 pane.insert(0, lab)
 
+    # Math: pages built for KaTeX mark formulas only by class, with no delimiters
+    # (measured on the real book: 1,570 inline and 191 display formulas). MathJax only
+    # typesets delimited math, so add the delimiters it expects.
+    # Top-level environments (align, equation, ...) are complete equations already;
+    # others (aligned, cases, matrix, ...) only work inside math and need the delimiters.
+    standalone = re.compile(r"\\begin\{(align|alignat|equation|gather|multline|eqnarray|flalign)\*?\}")
+    for span in content.select("span.math.inline, span.math.display"):
+        tex = span.get_text().strip()
+        if not tex or tex.startswith(("\\(", "\\[", "$$")) or standalone.match(tex):
+            continue
+        display = "display" in span.get("class", [])
+        span.string = ("\\[" + tex + "\\]") if display else ("\\(" + tex + "\\)")
+
     # Collapsed code / details: show them expanded.
     for d in content.find_all("details"):
         d["open"] = ""
@@ -855,6 +868,9 @@ table.dataframe th, table.dataframe td { padding: 2pt 5pt; white-space: nowrap; 
 .column-margin, .margin-aside, aside { font-size: 9pt; color: var(--muted); border-left: 2pt solid var(--rule); padding-left: 8pt; margin: .8em 0; }
 mjx-container[display="true"] { margin: .8em 0 !important; overflow: visible; }
 mjx-container svg { max-width: 100%%; }
+/* MathJax's hidden screen-reader copy of each formula: it can stick out past the page
+   edge (which makes Chromium shrink every page) and would duplicate the math as text. */
+html body mjx-container > mjx-assistive-mml { display: none !important; }
 .media-link { font-style: italic; color: var(--muted); }
 .csl-entry { margin-bottom: .5em; padding-left: 1.5em; text-indent: -1.5em; text-align: left; }
 .pm { float: left; width: 0; height: 0; overflow: visible; font-size: 2pt; line-height: 0; color: #000; white-space: nowrap; }
@@ -1023,11 +1039,16 @@ def assemble_html(book: Book, mathjax_src: str, with_markers: bool, page_numbers
             "displayMath": [["\\[", "\\]"], ["$$", "$$"]],
             "processEscapes": True,
             "packages": {"[+]": ["ams", "newcommand", "boldsymbol"]},
+            # KaTeX (used by the website) knows \bm; MathJax calls it \boldsymbol (226 uses in fpppy).
+            "macros": {"bm": ["\\boldsymbol{#1}", 1]},
         },
         "svg": {"fontCache": "global"},
         "chtml": {"matchFontHeight": False},
-        "options": {"skipHtmlTags": ["script", "noscript", "style", "textarea", "pre", "code"]},
+        "options": {"skipHtmlTags": ["script", "noscript", "style", "textarea", "pre", "code"],
+                    "enableAssistiveMml": False},
         "startup": {"typeset": True},
+        # Packages beyond MathJax's defaults must be loaded, not just listed under tex.packages.
+        "loader": {"load": ["[tex]/boldsymbol"]},
     }
     doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1115,7 +1136,19 @@ FIT_WIDE_ELEMENTS_JS = """() => {
     }
     if (z < 1) { el.style.zoom = z.toFixed(4); el.dataset.fitted = '1'; fitted++; }
   }
-  return [fitted, Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth)];
+  const overflow = Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  const culprits = [];
+  if (overflow > 1) {                                       // name the outermost elements still too wide
+    const right = document.body.getBoundingClientRect().right + 1;
+    for (const el of document.body.querySelectorAll('*')) {
+      if (el.getBoundingClientRect().right <= right || (el.parentElement && el.parentElement !== document.body
+          && el.parentElement.getBoundingClientRect().right > right)) continue;
+      culprits.push(`<${el.tagName.toLowerCase()} class="${el.className}"> ${Math.round(el.getBoundingClientRect().right - right)}px too wide: ` +
+                    (el.textContent || '').trim().slice(0, 60).replace(/\s+/g, ' '));
+      if (culprits.length >= 5) break;
+    }
+  }
+  return [fitted, overflow, culprits];
 }"""
 
 
@@ -1141,11 +1174,13 @@ def render_pdf(html_path: Path, pdf_path: Path, layout: Layout, chromium_path: s
         # If anything is wider than the page, Chromium shrinks the WHOLE document to fit
         # (measured: 10.5 pt body text printed at 7 pt because of one wide table).
         # Scale down only the elements that are too wide instead, as printed books do.
-        fitted, overflow = page.evaluate(FIT_WIDE_ELEMENTS_JS)
+        fitted, overflow, culprits = page.evaluate(FIT_WIDE_ELEMENTS_JS)
         if fitted:
             print(f"  scaled down {fitted} wide table(s)/block(s) to fit the page width")
         if overflow > 1:
             print(f"  WARNING: content still {overflow}px wider than the page; Chromium will shrink every page")
+            for c in culprits:
+                print(f"    {c}")
         page.pdf(path=str(pdf_path), width=f"{layout.width}mm", height=f"{layout.height}mm",
                  print_background=True, prefer_css_page_size=True,
                  display_header_footer=False)
@@ -1340,7 +1375,10 @@ def verify(pdf_path: Path, book: Book, headings: list[Heading], page_numbers: di
                 continue
             idx = page_numbers[hd.marker] - 1
             # Compare without numbering and whitespace ("Chapter 2" is printed via CSS).
-            words = [w for w in hd.text.split() if not re.fullmatch(r"[\dA-Z]+(\.\d+)*", w)]
+            # Only the leading section number is dropped: words like "ETS" or "ARIMA" stay.
+            words = hd.text.split()
+            if words and re.fullmatch(r"[\dA-Z]+(\.\d+)*", words[0]):
+                words = words[1:]
             probe = "".join(words)[:30]
             page_text = re.sub(r"\s+", "", texts[idx]) if idx < len(texts) else ""
             if idx <= toc_last or probe not in page_text:
